@@ -1,0 +1,74 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "aegis-scanner"
+version = "0.1.0"
+description = "AEGIS Security Scanner - Advanced security scanning with cognitive analysis"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "AEGIS Security Team"}
+]
+keywords = ["security", "scanner", "eBPF", "cognitive", "analysis"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Topic :: Security",
+]
+
+dependencies = [
+    "z3-solver>=4.12.0",
+    "scapy>=2.5.0",
+    "pyyaml>=6.0",
+    "requests>=2.31.0",
+    "aiohttp>=3.9.0",
+    "asyncio>=3.4.3",
+    "prctl>=1.8.1; sys_platform == 'linux'",
+    "flask>=3.0.0",
+    "flask-cors>=4.0.0",
+    "flask-socketio>=5.3.0",
+    "python-socketio>=5.10.0",
+    "eventlet>=0.33.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.5.0",
+]
+
+[project.scripts]
+aegis = "python_brain.main:main"
+
+[tool.maturin]
+python-source = "python_brain"
+module-name = "aegis_userspace"
+
+[tool.black]
+line-length = 100
+target-version = ["py38", "py39", "py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
