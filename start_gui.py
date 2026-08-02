@@ -23,15 +23,13 @@ def check_dependencies():
     required_packages = [
         'flask',
         'flask_cors',
-        'flask_socketio',
-        'socketio',
-        'eventlet'
+        'flask_socketio'
     ]
     
     missing = []
     for package in required_packages:
         try:
-            __import__(package.replace('_', '-'))
+            __import__(package)
         except ImportError:
             missing.append(package)
     

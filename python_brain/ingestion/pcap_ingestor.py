@@ -5,7 +5,7 @@ This module ingests PCAP files using scapy to extract unique IP/port pairs
 and identify proprietary protocols for the Rust network engine to fuzz.
 """
 
-from typing import Dict, List, Optional, Any, Tuple, Set
+from typing import Dict, List, Optional, Any, Tuple, Set, Union
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
