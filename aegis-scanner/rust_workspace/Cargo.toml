@@ -1,6 +1,0 @@
-[workspace]
-members = [
-    "aegis_userspace",
-    "aegis_ebpf",
-]
-resolver = "2"
