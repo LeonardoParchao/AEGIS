@@ -1,0 +1,23 @@
+[package]
+name = "aegis_userspace"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.20", features = ["extension-module"] }
+tokio = { version = "1.35", features = ["full"] }
+reqwest = { version = "0.11", features = ["json"] }
+hyper = { version = "0.14", features = ["full"] }
+lazy_static = "1.4"
+anyhow = "1.0"
+rand = "0.8"
+
+[target.'cfg(unix)'.dependencies]
+aya = "0.14"
+libpcap = "0.1.1"
+
+[build-dependencies]
+aya-build = "0.2"
