@@ -122,7 +122,7 @@ mod pcap_injection_memory_safety_tests {
     #[test]
     fn test_pcap_injector_creation_valid_interface() {
         // Note: This test may fail if the interface doesn't exist on the system
-        // In a real test environment, you'd mock the device lookup
+        // In a real test environment, you'd use a test network interface
         let result = PcapInjector::new("eth0");
         // We expect this might fail due to missing interface, but it shouldn't crash
         match result {
