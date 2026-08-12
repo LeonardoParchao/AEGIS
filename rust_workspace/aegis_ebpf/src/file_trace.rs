@@ -16,8 +16,16 @@ pub fn sys_enter_openat(ctx: TracePointContext) -> i32 {
 }
 
 fn try_sys_enter_openat(ctx: TracePointContext) -> Result<(), i32> {
+    // SECURITY NOTE: Fixed offset memory access is architecture-dependent
+    // Offset 24 is for x86_64 sys_enter_openat tracepoint. This may need adjustment
+    // for other architectures. Consider using aya_ebpf's tracepoint argument bindings
+    // for production use to read arguments by name instead of offset.
     let filename = unsafe {
         let ptr = ctx.read_at::<*const u8>(24).map_err(|_| 0)?;
+        // Add null pointer check for safety
+        if ptr.is_null() {
+            return Err(0);
+        }
         core::ffi::CStr::from_ptr(ptr as *const i8)
     };
 

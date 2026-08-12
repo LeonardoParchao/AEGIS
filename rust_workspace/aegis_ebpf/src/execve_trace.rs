@@ -1,6 +1,7 @@
 use aya_ebpf::programs::TracePointContext;
 
-const AEGIS_MARKER: &[u8] = b"AEGIS";
+// Security: Use a more specific marker to reduce false positives and bypass potential
+const AEGIS_MARKER: &[u8] = b"AEGIS-SCAN-MARKER-v1";
 
 #[no_mangle]
 pub fn sys_enter_execve(ctx: TracePointContext) -> i32 {
@@ -11,8 +12,16 @@ pub fn sys_enter_execve(ctx: TracePointContext) -> i32 {
 }
 
 fn try_sys_enter_execve(ctx: TracePointContext) -> Result<(), i32> {
+    // SECURITY NOTE: Fixed offset memory access is architecture-dependent
+    // Offset 16 is for x86_64 sys_enter_execve tracepoint. This may need adjustment
+    // for other architectures. Consider using aya_ebpf's tracepoint argument bindings
+    // for production use to read arguments by name instead of offset.
     let filename = unsafe {
         let ptr = ctx.read_at::<*const u8>(16).map_err(|_| 0)?;
+        // Add null pointer check for safety
+        if ptr.is_null() {
+            return Err(0);
+        }
         core::ffi::CStr::from_ptr(ptr as *const i8)
     };
 

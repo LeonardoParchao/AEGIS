@@ -14,6 +14,10 @@ pub fn tcp_v4_connect(ctx: TracePointContext) -> i32 {
 }
 
 fn try_tcp_v4_connect(ctx: TracePointContext) -> Result<(), i32> {
+    // SECURITY NOTE: Fixed offset memory access is architecture-dependent
+    // Offset 16 is for x86_64 tcp_v4_connect tracepoint. This may need adjustment
+    // for other architectures. Consider using aya_ebpf's tracepoint argument bindings
+    // for production use to read arguments by name instead of offset.
     let sock_addr = unsafe {
         ctx.read_at::<[u8; 16]>(16).map_err(|_| 0)?
     };
