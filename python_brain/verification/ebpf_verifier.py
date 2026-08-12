@@ -13,6 +13,62 @@ from datetime import datetime
 import threading
 import queue
 import json
+import os
+import logging
+
+logger = logging.getLogger(__name__)
+
+def check_ebpf_capabilities():
+    """
+    Check if the system has the required capabilities for eBPF operations.
+    
+    Returns:
+        Tuple of (has_capabilities, error_message)
+    """
+    try:
+        # Check if running as root or with CAP_BPF
+        if os.geteuid() != 0:
+            # Check for CAP_BPF capability (Linux 5.8+)
+            try:
+                import ctypes
+                # CAP_BPF = 43 (Linux capability)
+                CAP_BPF = 43
+                CAP_SYS_ADMIN = 21
+                
+                # Try to check capabilities via libcap
+                try:
+                    libcap = ctypes.CDLL('libcap.so.2')
+                    # This is a simplified check - in production, use proper capability checking
+                    # For now, we'll warn about running without root
+                    logger.warning("Running without root privileges. eBPF may not work properly.")
+                    return False, "eBPF requires root privileges or CAP_BPF capability"
+                except:
+                    logger.warning("Could not check capabilities. Assuming no eBPF support.")
+                    return False, "Cannot verify eBPF capabilities"
+            except Exception as e:
+                logger.warning(f"Capability check failed: {e}")
+                return False, f"Capability check failed: {str(e)}"
+        
+        # Check if /sys/kernel/debug/tracing is accessible
+        if not os.path.exists('/sys/kernel/debug/tracing'):
+            logger.warning("debugfs not mounted. eBPF tracepoints may not be accessible.")
+            return False, "debugfs not mounted at /sys/kernel/debug/tracing"
+        
+        # Check kernel version (eBPF requires Linux 3.18+)
+        try:
+            with open('/proc/version', 'r') as f:
+                version_info = f.read()
+                if 'Linux' not in version_info:
+                    logger.warning("Not running on Linux. eBPF is Linux-specific.")
+                    return False, "eBPF is only supported on Linux"
+        except Exception as e:
+            logger.warning(f"Could not check kernel version: {e}")
+        
+        return True, ""
+        
+    except Exception as e:
+        logger.error(f"Error checking eBPF capabilities: {e}")
+        return False, f"Error checking eBPF capabilities: {str(e)}"
 
 
 class BPFProgramType(Enum):
@@ -77,23 +133,46 @@ class EBPFVerifier:
                 - timeout_ms: Default timeout for verification attempts
                 - buffer_size: Size of the kernel trace buffer
                 - enable_logging: Whether to enable debug logging
+                - skip_capability_check: Skip eBPF capability checks (for testing)
         """
         self.config = config or {}
         self.rust_module_path = self.config.get('rust_module_path', 'aegis_userspace')
         self.timeout_ms = self.config.get('timeout_ms', 5000)
         self.buffer_size = self.config.get('buffer_size', 1024 * 1024)
         self.enable_logging = self.config.get('enable_logging', False)
+        self.skip_capability_check = self.config.get('skip_capability_check', False)
         
         self._rust_interface = None
         self._event_queue = queue.Queue()
         self._monitoring_active = False
         self._monitor_thread = None
+        self._ebpf_available = False
+        
+        # Check eBPF capabilities unless explicitly skipped
+        if not self.skip_capability_check:
+            has_caps, error_msg = check_ebpf_capabilities()
+            if not has_caps:
+                logger.warning(f"eBPF capabilities check failed: {error_msg}")
+                logger.warning("eBPF verification will be disabled. Running in degraded mode.")
+                self._ebpf_available = False
+            else:
+                self._ebpf_available = True
+                if self.enable_logging:
+                    logger.info("eBPF capabilities verified successfully")
+        else:
+            logger.warning("Skipping eBPF capability check as requested")
+            self._ebpf_available = True
         
         # Load the Rust PyO3 interface
         self._load_rust_interface()
     
     def _load_rust_interface(self):
         """Load the Rust PyO3 module for eBPF operations."""
+        if not self._ebpf_available:
+            logger.info("eBPF not available, using degraded mode interface")
+            self._rust_interface = self._create_degraded_interface()
+            return
+            
         try:
             # This will be the actual Rust PyO3 module when compiled
             # For now, we'll create a mock interface
@@ -133,6 +212,32 @@ class EBPFVerifier:
                 return True
         
         return MockRustInterface()
+    
+    def _create_degraded_interface(self) -> Any:
+        """Create a degraded interface when eBPF is not available."""
+        class DegradedInterface:
+            def load_bpf_program(self, program_type, program_data):
+                logger.warning("eBPF not available - cannot load BPF program")
+                return False
+            
+            def attach_tracepoint(self, tracepoint):
+                logger.warning("eBPF not available - cannot attach tracepoint")
+                return False
+            
+            def fire_payload(self, payload, target):
+                logger.warning("eBPF not available - cannot fire payload with kernel monitoring")
+                return {"success": False, "error": "eBPF not available"}
+            
+            def read_trace_events(self):
+                return []
+            
+            def detach_tracepoint(self, tracepoint):
+                return True
+            
+            def unload_bpf_program(self):
+                return True
+        
+        return DegradedInterface()
     
     def verify_vulnerability(
         self,

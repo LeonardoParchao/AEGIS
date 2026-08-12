@@ -7,15 +7,20 @@ Provides REST endpoints for the web interface to interact with the scanner.
 import asyncio
 import json
 import logging
+import os
 import threading
+import time
+from collections import defaultdict
 from datetime import datetime
+from functools import wraps
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 import uuid
 
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
+from werkzeug.exceptions import Unauthorized
 
 from python_brain.orchestrator.scanner_manager import (
     ScannerManager,
@@ -31,15 +36,253 @@ from python_brain.reporting.report_generator import ReportGenerator
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'aegis-scanner-secret-key-change-in-production'
-CORS(app)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', os.urandom(32).hex())
+
+# Configure CORS with restricted origins for security
+# Set CORS_ALLOWED_ORIGINS environment variable to comma-separated list of allowed origins
+# Default: localhost and 127.0.0.1 on port 5000 for development
+allowed_origins = os.environ.get('CORS_ALLOWED_ORIGINS', 'http://localhost:5000,http://127.0.0.1:5000').split(',')
+CORS(app, origins=allowed_origins)
+socketio = SocketIO(app, cors_allowed_origins=allowed_origins, async_mode='threading')
+
+# Security headers middleware
+@app.after_request
+def add_security_headers(response):
+    """Add security headers to all responses."""
+    # HTTP Strict Transport Security (HSTS) - only enable in production with HTTPS
+    if os.environ.get('ENABLE_HSTS', 'false').lower() == 'true':
+        response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    
+    # Prevent content type sniffing
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    
+    # Prevent clickjacking
+    response.headers['X-Frame-Options'] = 'DENY'
+    
+    # Enable browser XSS protection
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    
+    # Content Security Policy (basic - can be customized via environment variable)
+    csp = os.environ.get('CSP_POLICY', "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'")
+    response.headers['Content-Security-Policy'] = csp
+    
+    # Referrer policy
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    
+    # Permissions policy
+    response.headers['Permissions-Policy'] = 'geolocation=(), microphone=(), camera=()'
+    
+    return response
+
+# Authentication configuration
+API_KEY = os.environ.get('AEGIS_API_KEY')
+if not API_KEY:
+    logger.warning("AEGIS_API_KEY not set - authentication disabled. Set this environment variable for production.")
+    API_KEY = None
+
+def require_auth(f):
+    """Decorator to require API key authentication for endpoints."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if API_KEY is None:
+            # Authentication disabled in development
+            return f(*args, **kwargs)
+        
+        auth_header = request.headers.get('Authorization')
+        if not auth_header:
+            return jsonify({'error': 'Authorization header required'}), 401
+        
+        # Support both Bearer token and direct API key
+        if auth_header.startswith('Bearer '):
+            provided_key = auth_header[7:]
+        else:
+            provided_key = auth_header
+        
+        if provided_key != API_KEY:
+            return jsonify({'error': 'Invalid API key'}), 401
+        
+        return f(*args, **kwargs)
+    return decorated
+
+def rate_limit(f):
+    """Decorator to apply rate limiting to endpoints."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        client_ip = request.remote_addr
+        allowed, error_msg = check_rate_limit(client_ip)
+        if not allowed:
+            return jsonify({'error': error_msg}), 429
+        return f(*args, **kwargs)
+    return decorated
 
 # Global scanner instance
 scanner: Optional[ScannerManager] = None
 state_manager: Optional[TargetStateManager] = None
 current_scan_id: Optional[str] = None
 scan_results: Dict[str, Any] = {}
+
+# Rate limiting and resource management
+MAX_CONCURRENT_SCANS = int(os.environ.get('AEGIS_MAX_CONCURRENT_SCANS', '2'))
+active_scans_count = 0
+scan_lock = threading.Lock()
+
+# Rate limiting: max requests per minute per IP
+RATE_LIMIT_REQUESTS = int(os.environ.get('AEGIS_RATE_LIMIT_REQUESTS', '30'))
+RATE_LIMIT_WINDOW = 60  # seconds
+request_tracker = defaultdict(list)  # IP -> list of timestamps
+
+def check_rate_limit(ip: str) -> Tuple[bool, str]:
+    """
+    Check if the IP has exceeded the rate limit.
+    
+    Args:
+        ip: The client IP address
+        
+    Returns:
+        Tuple of (allowed, error_message)
+    """
+    current_time = time.time()
+    
+    # Clean up old requests outside the time window
+    request_tracker[ip] = [
+        timestamp for timestamp in request_tracker[ip]
+        if current_time - timestamp < RATE_LIMIT_WINDOW
+    ]
+    
+    # Check if limit exceeded
+    if len(request_tracker[ip]) >= RATE_LIMIT_REQUESTS:
+        return False, f"Rate limit exceeded: max {RATE_LIMIT_REQUESTS} requests per {RATE_LIMIT_WINDOW} seconds"
+    
+    # Add current request
+    request_tracker[ip].append(current_time)
+    return True, ""
+
+def can_start_scan() -> Tuple[bool, str]:
+    """
+    Check if a new scan can be started based on concurrent scan limits.
+    
+    Returns:
+        Tuple of (can_start, error_message)
+    """
+    with scan_lock:
+        if active_scans_count >= MAX_CONCURRENT_SCANS:
+            return False, f"Maximum concurrent scans ({MAX_CONCURRENT_SCANS}) reached. Please wait for current scans to complete."
+        active_scans_count += 1
+        return True, ""
+
+def decrement_active_scans():
+    """Decrement the active scans count."""
+    global active_scans_count
+    with scan_lock:
+        active_scans_count = max(0, active_scans_count - 1)
+
+# Security: Define allowed base directory for file inputs
+ALLOWED_INPUT_DIR = os.environ.get('AEGIS_ALLOWED_INPUT_DIR', os.getcwd())
+
+def validate_file_path(file_path: str) -> Tuple[bool, str]:
+    """
+    Validate that a file path is within the allowed directory to prevent path traversal attacks.
+    
+    Args:
+        file_path: The file path to validate
+        
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    try:
+        # Resolve the absolute path
+        abs_path = Path(file_path).resolve()
+        
+        # Resolve the allowed directory absolute path
+        allowed_dir = Path(ALLOWED_INPUT_DIR).resolve()
+        
+        # Check if the resolved path is within the allowed directory
+        try:
+            abs_path.relative_to(allowed_dir)
+        except ValueError:
+            return False, f"File path must be within allowed directory: {allowed_dir}"
+        
+        # Check if file exists
+        if not abs_path.exists():
+            return False, f"File not found: {file_path}"
+        
+        # Check if it's a file (not a directory)
+        if not abs_path.is_file():
+            return False, f"Path is not a file: {file_path}"
+        
+        return True, ""
+        
+    except Exception as e:
+        return False, f"Invalid file path: {str(e)}"
+
+def validate_scan_config(data: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Validate scan configuration parameters to prevent injection and ensure safe values.
+    
+    Args:
+        data: The scan configuration data
+        
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    # Validate target_type
+    target_type = data.get('target_type')
+    if target_type not in ['openapi', 'pcap', 'url']:
+        return False, f"Invalid target_type: {target_type}. Must be one of: openapi, pcap, url"
+    
+    # Validate scan_type
+    scan_type = data.get('scan_type', 'full')
+    if scan_type not in ['full', 'quick', 'custom']:
+        return False, f"Invalid scan_type: {scan_type}. Must be one of: full, quick, custom"
+    
+    # Validate timeout (must be between 1 and 3600 seconds)
+    timeout = data.get('timeout', 300)
+    try:
+        timeout = int(timeout)
+        if timeout < 1 or timeout > 3600:
+            return False, f"Invalid timeout: {timeout}. Must be between 1 and 3600 seconds"
+    except (ValueError, TypeError):
+        return False, f"Invalid timeout value: {timeout}. Must be an integer"
+    
+    # Validate max_threads (must be between 1 and 16)
+    max_threads = data.get('max_threads', 4)
+    try:
+        max_threads = int(max_threads)
+        if max_threads < 1 or max_threads > 16:
+            return False, f"Invalid max_threads: {max_threads}. Must be between 1 and 16"
+    except (ValueError, TypeError):
+        return False, f"Invalid max_threads value: {max_threads}. Must be an integer"
+    
+    # Validate cognitive_depth (must be between 1 and 5)
+    cognitive_depth = data.get('cognitive_depth', 3)
+    try:
+        cognitive_depth = int(cognitive_depth)
+        if cognitive_depth < 1 or cognitive_depth > 5:
+            return False, f"Invalid cognitive_depth: {cognitive_depth}. Must be between 1 and 5"
+    except (ValueError, TypeError):
+        return False, f"Invalid cognitive_depth value: {cognitive_depth}. Must be an integer"
+    
+    # Validate boolean parameters
+    for param in ['enable_fuzzing', 'enable_verification']:
+        value = data.get(param)
+        if value is not None and not isinstance(value, bool):
+            return False, f"Invalid {param}: {value}. Must be a boolean"
+    
+    # Validate URL format if target_type is url
+    if target_type == 'url':
+        target = data.get('target')
+        if target:
+            from urllib.parse import urlparse
+            try:
+                parsed = urlparse(target)
+                if not all([parsed.scheme, parsed.netloc]):
+                    return False, f"Invalid URL format: {target}"
+                if parsed.scheme not in ['http', 'https']:
+                    return False, f"Invalid URL scheme: {parsed.scheme}. Must be http or https"
+            except Exception as e:
+                return False, f"Invalid URL: {str(e)}"
+    
+    return True, ""
 
 
 def initialize_scanner():
@@ -87,6 +330,7 @@ def index():
 
 
 @app.route('/api/health', methods=['GET'])
+@require_auth
 def health_check():
     """Health check endpoint."""
     return jsonify({
@@ -97,11 +341,18 @@ def health_check():
 
 
 @app.route('/api/scan/start', methods=['POST'])
+@require_auth
+@rate_limit
 def start_scan():
     """Start a new scan."""
     global current_scan_id, scan_results
     
     try:
+        # Check concurrent scan limit
+        can_start, error_msg = can_start_scan()
+        if not can_start:
+            return jsonify({'error': error_msg}), 429
+        
         initialize_scanner()
         
         data = request.get_json()
@@ -111,18 +362,38 @@ def start_scan():
         timeout = data.get('timeout', 300)
         max_threads = data.get('max_threads', 4)
         cognitive_depth = data.get('cognitive_depth', 3)
-        enable_fuzzing = data.get('enable_fuzzing', True)
+        enable_fuzzing = data.get('enable_fuzzing', False)  # Default to False for security
         enable_verification = data.get('enable_verification', True)
         
         # Validate inputs
         if not target_type or not target:
             return jsonify({'error': 'target_type and target are required'}), 400
         
-        # Validate file exists for openapi and pcap
+        # Validate scan configuration parameters
+        is_valid, error_msg = validate_scan_config(data)
+        if not is_valid:
+            return jsonify({'error': error_msg}), 400
+        
+        # Validate and sanitize additional_params to prevent injection
+        allowed_additional_params = ['target_type', 'url']
+        additional_params = {}
+        for key, value in data.items():
+            if key in allowed_additional_params:
+                additional_params[key] = value
+            elif key not in ['target_type', 'target', 'scan_type', 'timeout', 'max_threads', 
+                            'cognitive_depth', 'enable_fuzzing', 'enable_verification']:
+                logger.warning(f"Ignoring unexpected parameter: {key}")
+        
+        # Ensure target_type is in additional_params
+        additional_params['target_type'] = target_type
+        if target_type == 'url':
+            additional_params['url'] = target
+        
+        # Validate file exists for openapi and pcap with path traversal protection
         if target_type in ['openapi', 'pcap']:
-            target_path = Path(target)
-            if not target_path.exists():
-                return jsonify({'error': f'Target file not found: {target}'}), 400
+            is_valid, error_msg = validate_file_path(target)
+            if not is_valid:
+                return jsonify({'error': error_msg}), 400
         
         # Create scan configuration
         config = ScanConfig(
@@ -133,10 +404,7 @@ def start_scan():
             enable_fuzzing=enable_fuzzing,
             enable_verification=enable_verification,
             cognitive_depth=cognitive_depth,
-            additional_params={
-                'target_type': target_type,
-                'url': target if target_type == 'url' else None
-            }
+            additional_params=additional_params
         )
         
         # Generate scan ID
@@ -184,6 +452,7 @@ def start_scan():
                 socketio.emit('scan_error', {'scan_id': current_scan_id, 'error': str(e)})
             finally:
                 loop.close()
+                decrement_active_scans()
         
         scan_thread = threading.Thread(target=run_scan_async, daemon=True)
         scan_thread.start()
@@ -200,6 +469,8 @@ def start_scan():
 
 
 @app.route('/api/scan/stop', methods=['POST'])
+@require_auth
+@rate_limit
 def stop_scan():
     """Stop the current scan."""
     try:
@@ -213,6 +484,8 @@ def stop_scan():
 
 
 @app.route('/api/scan/status', methods=['GET'])
+@require_auth
+@rate_limit
 def get_scan_status():
     """Get the status of the current or specified scan."""
     scan_id = request.args.get('scan_id', current_scan_id)
@@ -224,6 +497,8 @@ def get_scan_status():
 
 
 @app.route('/api/scan/results', methods=['GET'])
+@require_auth
+@rate_limit
 def get_scan_results():
     """Get detailed results for a scan."""
     scan_id = request.args.get('scan_id')
@@ -239,6 +514,8 @@ def get_scan_results():
 
 
 @app.route('/api/scan/history', methods=['GET'])
+@require_auth
+@rate_limit
 def get_scan_history():
     """Get history of all scans."""
     return jsonify({
@@ -248,6 +525,8 @@ def get_scan_history():
 
 
 @app.route('/api/scan/<scan_id>/report', methods=['GET'])
+@require_auth
+@rate_limit
 def get_scan_report(scan_id):
     """Get the report for a specific scan."""
     if scan_id not in scan_results:
@@ -265,6 +544,8 @@ def get_scan_report(scan_id):
 
 
 @app.route('/api/scan/<scan_id>/export', methods=['GET'])
+@require_auth
+@rate_limit
 def export_scan_report(scan_id):
     """Export scan report in specified format."""
     format_type = request.args.get('format', 'json')
@@ -318,6 +599,8 @@ def export_scan_report(scan_id):
 
 
 @app.route('/api/target/validate', methods=['POST'])
+@require_auth
+@rate_limit
 def validate_target():
     """Validate a target before scanning."""
     try:
@@ -331,6 +614,13 @@ def validate_target():
         validation_result = {'valid': True, 'warnings': []}
         
         if target_type == 'openapi':
+            # Validate file path to prevent path traversal
+            is_valid, error_msg = validate_file_path(target)
+            if not is_valid:
+                validation_result['valid'] = False
+                validation_result['error'] = error_msg
+                return jsonify(validation_result)
+            
             parser = OpenAPIParser()
             try:
                 spec = parser.parse_file(target)
@@ -347,6 +637,13 @@ def validate_target():
                 validation_result['error'] = str(e)
                 
         elif target_type == 'pcap':
+            # Validate file path to prevent path traversal
+            is_valid, error_msg = validate_file_path(target)
+            if not is_valid:
+                validation_result['valid'] = False
+                validation_result['error'] = error_msg
+                return jsonify(validation_result)
+            
             ingestor = PcapIngestor()
             try:
                 analysis = ingestor.ingest_file(target)
@@ -387,6 +684,7 @@ def validate_target():
 
 
 @app.route('/api/config', methods=['GET', 'POST'])
+@require_auth
 def handle_config():
     """Get or update scanner configuration."""
     if request.method == 'GET':

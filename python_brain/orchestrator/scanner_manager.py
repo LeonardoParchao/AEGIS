@@ -46,7 +46,7 @@ class ScanConfig:
     scan_type: str = "full"  # full, quick, custom
     max_threads: int = 4
     timeout: int = 300  # seconds
-    enable_fuzzing: bool = True
+    enable_fuzzing: bool = False  # Default to False for security - requires explicit enable
     enable_verification: bool = True
     cognitive_depth: int = 3
     custom_modules: List[str] = field(default_factory=list)
