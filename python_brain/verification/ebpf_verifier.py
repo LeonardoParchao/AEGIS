@@ -169,75 +169,24 @@ class EBPFVerifier:
     def _load_rust_interface(self):
         """Load the Rust PyO3 module for eBPF operations."""
         if not self._ebpf_available:
-            logger.info("eBPF not available, using degraded mode interface")
-            self._rust_interface = self._create_degraded_interface()
-            return
+            raise RuntimeError(
+                "eBPF capabilities not available. "
+                "This scanner requires eBPF support for kernel-level verification. "
+                "Please ensure you are running on Linux with proper privileges and kernel support."
+            )
             
         try:
-            # This will be the actual Rust PyO3 module when compiled
-            # For now, we'll create a mock interface
             import importlib
             self._rust_interface = importlib.import_module(self.rust_module_path)
             
             if self.enable_logging:
                 print(f"Loaded Rust interface from {self.rust_module_path}")
-        except ImportError:
-            # Create a mock interface for development/testing
-            if self.enable_logging:
-                print(f"Warning: Could not load Rust module {self.rust_module_path}, using mock interface")
-            self._rust_interface = self._create_mock_interface()
-    
-    def _create_mock_interface(self) -> Any:
-        """Create a mock Rust interface for development purposes."""
-        class MockRustInterface:
-            def load_bpf_program(self, program_type, program_data):
-                return True
-            
-            def attach_tracepoint(self, tracepoint):
-                return True
-            
-            def fire_payload(self, payload, target):
-                # Simulate some processing time
-                import time
-                time.sleep(0.01)
-                return {"success": True, "kernel_sink": False}
-            
-            def read_trace_events(self):
-                return []
-            
-            def detach_tracepoint(self, tracepoint):
-                return True
-            
-            def unload_bpf_program(self):
-                return True
-        
-        return MockRustInterface()
-    
-    def _create_degraded_interface(self) -> Any:
-        """Create a degraded interface when eBPF is not available."""
-        class DegradedInterface:
-            def load_bpf_program(self, program_type, program_data):
-                logger.warning("eBPF not available - cannot load BPF program")
-                return False
-            
-            def attach_tracepoint(self, tracepoint):
-                logger.warning("eBPF not available - cannot attach tracepoint")
-                return False
-            
-            def fire_payload(self, payload, target):
-                logger.warning("eBPF not available - cannot fire payload with kernel monitoring")
-                return {"success": False, "error": "eBPF not available"}
-            
-            def read_trace_events(self):
-                return []
-            
-            def detach_tracepoint(self, tracepoint):
-                return True
-            
-            def unload_bpf_program(self):
-                return True
-        
-        return DegradedInterface()
+        except ImportError as e:
+            raise RuntimeError(
+                f"Could not load Rust module {self.rust_module_path}. "
+                f"Please ensure the Rust userspace library is compiled and installed. "
+                f"Error: {str(e)}"
+            )
     
     def verify_vulnerability(
         self,

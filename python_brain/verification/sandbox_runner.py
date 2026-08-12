@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 import json
 import threading
 import time
+import os
 
 
 class IsolationLevel(Enum):
@@ -100,85 +101,17 @@ class SandboxRunner:
             
             if self.config.log_level == "DEBUG":
                 print("Docker client initialized successfully")
-        except ImportError:
-            if self.config.log_level == "DEBUG":
-                print("Docker SDK not available, using mock interface")
-            self._docker_client = self._create_mock_docker_client()
+        except ImportError as e:
+            raise RuntimeError(
+                "Docker SDK not available. "
+                "Please install the Docker Python SDK: pip install docker "
+                "and ensure Docker is running on your system."
+            )
         except Exception as e:
-            if self.config.log_level == "DEBUG":
-                print(f"Failed to initialize Docker client: {e}")
-            self._docker_client = self._create_mock_docker_client()
-    
-    def _create_mock_docker_client(self) -> Any:
-        """Create a mock Docker client for development/testing."""
-        class MockDockerClient:
-            def __init__(self):
-                self.containers = MockContainers()
-                self.images = MockImages()
-                self.networks = MockNetworks()
-            
-            def ping(self):
-                return True
-        
-        class MockContainers:
-            def __init__(self):
-                self._counter = 0
-                self._running = {}
-            
-            def run(self, image, command=None, environment=None, ports=None,
-                   volumes=None, network_mode=None, mem_limit=None,
-                   cpu_quota=None, detach=True, remove=False):
-                container_id = f"mock_container_{self._counter}"
-                self._counter += 1
-                self._running[container_id] = {
-                    'image': image,
-                    'command': command,
-                    'status': 'running'
-                }
-                return MockContainer(container_id)
-            
-            def get(self, container_id):
-                return MockContainer(container_id)
-            
-            def list(self, all=False):
-                return [MockContainer(cid) for cid in self._running.keys()]
-        
-        class MockContainer:
-            def __init__(self, container_id):
-                self.id = container_id
-                self.status = "running"
-                self._logs = ""
-            
-            def logs(self):
-                return b"Mock container logs"
-            
-            def stop(self):
-                self.status = "exited"
-            
-            def remove(self, force=False):
-                pass
-            
-            def wait(self):
-                return {'StatusCode': 0}
-            
-            def exec_run(self, cmd):
-                return (0, b"Mock exec output")
-        
-        class MockImages:
-            def pull(self, repository):
-                pass
-            
-            def list(self):
-                return []
-        
-        class MockNetworks:
-            def create(self, name, driver):
-                return {'id': f'network_{name}'}
-            
-            def remove(self, network_id):
-                pass
-        
-        return MockDockerClient()
+            raise RuntimeError(
+                f"Failed to initialize Docker client: {str(e)}. "
+                "Please ensure Docker is running and accessible."
+            )
     
     def execute_payload(
         self,
@@ -288,8 +221,9 @@ class SandboxRunner:
                     container.remove(force=True)
                     with self._lock:
                         self._active_containers.pop(container_id, None)
-                except:
-                    pass
+                except Exception as e:
+                    if self.config.log_level == "DEBUG":
+                        print(f"Error during cleanup: {e}")
             
             return ExecutionResult(
                 success=False,
@@ -332,21 +266,39 @@ class SandboxRunner:
 
         # Run tcpdump to capture traffic
         try:
+            network_interface = f'docker{container.attrs["NetworkSettings"]["Networks"]["bridge"]["Index"]}'
             subprocess.run(
-                ['tcpdump', '-i', f'docker{container.attrs["NetworkSettings"]["Networks"]["bridge"]["Index"]}', '-w', temp_file_path],
+                ['tcpdump', '-i', network_interface, '-w', temp_file_path],
                 timeout=self.config.timeout_seconds,
                 check=True
             )
             network_captured = True
-        except subprocess.CalledProcessError:
+        except subprocess.CalledProcessError as e:
+            if self.config.log_level == "DEBUG":
+                print(f"tcpdump failed: {e}")
+            network_captured = False
+        except Exception as e:
+            if self.config.log_level == "DEBUG":
+                print(f"Network capture error: {e}")
             network_captured = False
 
         # Read the captured traffic
-        with open(temp_file_path, 'rb') as temp_file:
-            captured_data = temp_file.read()
+        captured_data = None
+        if network_captured:
+            try:
+                with open(temp_file_path, 'rb') as temp_file:
+                    captured_data = temp_file.read()
+            except Exception as e:
+                if self.config.log_level == "DEBUG":
+                    print(f"Failed to read capture file: {e}")
+                network_captured = False
 
         # Cleanup the temporary file
-        os.unlink(temp_file_path)
+        try:
+            os.unlink(temp_file_path)
+        except Exception as e:
+            if self.config.log_level == "DEBUG":
+                print(f"Failed to cleanup temp file: {e}")
 
         return captured_data, network_captured
     
@@ -361,35 +313,28 @@ class SandboxRunner:
 
         # Remove the temporary file
         for file_path in temp_file_paths:
-            os.unlink(file_path)
+            try:
+                os.unlink(file_path)
+            except Exception as e:
+                if self.config.log_level == "DEBUG":
+                    print(f"Failed to cleanup {file_path}: {e}")
     
     def _post_process_network_capture(self, container_id: str, captured_data: bytes) -> bytes:
         """
         Post-process network capture data for a container.
         
-        This implementation simply removes the first 12 bytes of data, which are the tcpdump header.
+        This implementation removes the pcap file header (first 24 bytes for global header,
+        plus 16 bytes per packet header). For simplicity, we remove the first 24 bytes.
         """
-        return captured_data[12:]
+        if len(captured_data) > 24:
+            return captured_data[24:]
+        return captured_data
     
     def cleanup_network_capture_container(self, container_id: str):
         """Cleanup network capture files and data for a container."""
-        import glob
-        import os
-
-        # Get the path of the temporary file for this container
-        temp_file_pattern = f'/tmp/aegis-scanner-network-capture-{container_id}*'
-        temp_file_paths = glob.glob(temp_file_pattern)
-
-        # Remove the temporary file
-        for file_path in temp_file_paths:
-            os.unlink(file_path)
-
-        # Remove network capture data
+        self.cleanup_network_capture(container_id)
         if container_id in self._active_containers:
             self._active_containers[container_id]['network_data'] = None
-        """Cleanup network capture files and data for a container."""
-        self.cleanup_network_capture(container_id)
-        self._active_containers[container_id]['network_data'] = None
         return True
     
     def create_sandbox_pool(
@@ -585,5 +530,6 @@ class SandboxRunner:
         """Cleanup on destruction."""
         try:
             self.cleanup_all()
-        except:
-            pass
+        except Exception as e:
+            if self.config.log_level == "DEBUG":
+                print(f"Error during destruction cleanup: {e}")

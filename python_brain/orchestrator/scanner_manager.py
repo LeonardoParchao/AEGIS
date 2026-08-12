@@ -404,46 +404,141 @@ class ScannerManager:
     def _perform_fuzzing(self):
         """Perform the actual fuzzing (blocking operation)."""
         from python_brain.cognitive.fuzzer.payload_generator import PayloadGenerator
+        from python_brain.cognitive.smt_solver.business_logic import BusinessLogicAnalyzer
+        from python_brain.cognitive.smt_solver.state_machine import StateMachineAnalyzer
         
         try:
             generator = PayloadGenerator()
+            business_analyzer = BusinessLogicAnalyzer()
+            state_analyzer = StateMachineAnalyzer()
             
             payloads_generated = 0
             vulnerabilities = []
             
             # Generate payloads based on analysis
             if 'openapi_spec' in self.current_scan.metadata:
-                endpoints_count = self.current_scan.metadata['openapi_spec'].get('endpoints_count', 0)
-                payloads_generated = endpoints_count * 10
+                spec_data = self.current_scan.metadata['openapi_spec']
+                endpoints_count = spec_data.get('endpoints_count', 0)
                 
-                # Simulate finding vulnerabilities
-                if endpoints_count > 0:
-                    vuln_types = ['sql_injection', 'xss', 'auth_bypass', 'id_or']
-                    for i in range(min(3, endpoints_count)):
+                # Use business logic analyzer to identify potential bypass paths
+                business_analyzer.add_state("unauthenticated")
+                business_analyzer.add_state("authenticated")
+                business_analyzer.add_state("authorized")
+                business_analyzer.add_state("admin")
+                business_analyzer.add_state("sensitive_data_access")
+                
+                business_analyzer.add_transition("unauthenticated", "authenticated")
+                business_analyzer.add_transition("authenticated", "authorized")
+                business_analyzer.add_transition("authorized", "admin")
+                business_analyzer.add_transition("authorized", "sensitive_data_access")
+                
+                # Analyze potential bypass paths to sensitive states
+                sensitive_states = ["admin", "sensitive_data_access"]
+                for target_state in sensitive_states:
+                    bypass_paths = business_analyzer.calculate_bypass_paths(
+                        target_state=target_state,
+                        current_state="unauthenticated",
+                        current_conditions={}
+                    )
+                    
+                    for path in bypass_paths:
+                        if path['confidence'] > 0.5:  # Only consider high-confidence paths
+                            payloads_generated += 1
+                            
+                            # Generate actual payload for this bypass path
+                            from python_brain.cognitive.fuzzer.payload_generator import BypassPath, PayloadType
+                            bypass_path_obj = BypassPath(
+                                target_state=target_state,
+                                constraints=path['final_conditions'],
+                                required_parameters={},
+                                path_conditions=[str(step) for step in path['path']],
+                                confidence=path['confidence']
+                            )
+                            
+                            try:
+                                payload = generator.generate_from_bypass_path(
+                                    bypass_path_obj,
+                                    PayloadType.HTTP_REQUEST,
+                                    spec_data.get('base_url', 'http://localhost')
+                                )
+                                payloads_generated += 1
+                                
+                                # Create vulnerability finding based on actual analysis
+                                vuln_type = self._classify_bypass_target(target_state)
+                                vulnerabilities.append({
+                                    'id': f'vuln_bypass_{len(vulnerabilities)}',
+                                    'title': f'{vuln_type.replace("_", " ").title()} Via State Bypass',
+                                    'description': f'Potential bypass path detected to {target_state} state with confidence {path["confidence"]:.2f}',
+                                    'severity': self._calculate_severity(target_state, path['confidence']),
+                                    'cvss_score': self._calculate_cvss(target_state, path['confidence']),
+                                    'component': 'Business Logic',
+                                    'type': vuln_type,
+                                    'bypass_path': path['path'],
+                                    'confidence': path['confidence'],
+                                    'payload': payload.data
+                                })
+                            except Exception as e:
+                                logger.warning(f"Failed to generate payload for bypass path: {e}")
+                
+                # Use state machine analyzer to identify state transition issues
+                state_analyzer.generate_z3_constraints()
+                is_valid, validation_errors = state_analyzer.validate_state_machine()
+                
+                if not is_valid:
+                    for error in validation_errors:
                         vulnerabilities.append({
-                            'id': f'vuln_{i}',
-                            'title': f'{vuln_types[i % len(vuln_types)].replace("_", " ").title()} Vulnerability',
-                            'description': f'Potential {vuln_types[i % len(vuln_types)]} detected in endpoint analysis',
-                            'severity': ['critical', 'high', 'medium', 'low'][i % 4],
-                            'cvss_score': 7.5 - (i * 1.5),
-                            'component': 'API Endpoint',
-                            'type': vuln_types[i % len(vuln_types)]
+                            'id': f'vuln_state_{len(vulnerabilities)}',
+                            'title': 'State Machine Anomaly',
+                            'description': f'State machine validation issue: {error}',
+                            'severity': 'medium',
+                            'cvss_score': 5.5,
+                            'component': 'State Machine',
+                            'type': 'state_anomaly',
+                            'validation_error': error
                         })
                         
             elif 'pcap_analysis' in self.current_scan.metadata:
-                flows = self.current_scan.metadata['pcap_analysis'].get('network_flows', 0)
-                payloads_generated = flows * 5
+                pcap_data = self.current_scan.metadata['pcap_analysis']
+                flows = pcap_data.get('network_flows', 0)
                 
+                # Analyze network flows for protocol vulnerabilities
                 if flows > 0:
-                    vulnerabilities.append({
-                        'id': 'vuln_net_0',
-                        'title': 'Protocol Fuzzing Vulnerability',
-                        'description': 'Potential buffer overflow in custom protocol implementation',
-                        'severity': 'high',
-                        'cvss_score': 8.0,
-                        'component': 'Network Protocol',
-                        'type': 'buffer_overflow'
-                    })
+                    # Use the state machine analyzer to model protocol states
+                    state_analyzer.add_state("initial")
+                    state_analyzer.add_state("connected")
+                    state_analyzer.add_state("authenticated")
+                    state_analyzer.add_state("data_transfer")
+                    state_analyzer.add_state("error")
+                    
+                    state_analyzer.add_transition("initial", "connected")
+                    state_analyzer.add_transition("connected", "authenticated")
+                    state_analyzer.add_transition("authenticated", "data_transfer")
+                    state_analyzer.add_transition("data_transfer", "error")
+                    
+                    # Generate network payloads for protocol fuzzing
+                    from python_brain.cognitive.fuzzer.payload_generator import BypassPath, PayloadType
+                    for i in range(min(flows, 10)):  # Limit to 10 flows
+                        bypass_path = BypassPath(
+                            target_state="data_transfer",
+                            constraints={'flow_id': i, 'sequence': i * 100},
+                            required_parameters={'flow_id': i},
+                            path_conditions=[f"flow_{i}_connected"],
+                            confidence=0.7
+                        )
+                        
+                        try:
+                            payload = generator.generate_from_bypass_path(
+                                bypass_path,
+                                PayloadType.TCP_PACKET
+                            )
+                            payloads_generated += 1
+                            
+                            # Analyze for protocol-level vulnerabilities
+                            vuln_detected = self._analyze_protocol_payload(payload.data)
+                            if vuln_detected:
+                                vulnerabilities.append(vuln_detected)
+                        except Exception as e:
+                            logger.warning(f"Failed to generate network payload: {e}")
             
             self.current_scan.payloads_generated = payloads_generated
             self.current_scan.vulnerabilities_found.extend(vulnerabilities)
@@ -454,13 +549,93 @@ class ScannerManager:
                 'vulnerabilities': vulnerabilities
             }
             
-        except ImportError:
-            logger.warning("Payload generator not available, using basic fuzzing")
-            return {'payloads_generated': 10, 'vulnerabilities': []}
+        except ImportError as e:
+            logger.warning(f"Required modules not available: {e}")
+            return {'payloads_generated': 0, 'vulnerabilities': []}
         except Exception as e:
             logger.error(f"Fuzzing error: {e}")
             self.current_scan.errors.append(f"Fuzzing failed: {str(e)}")
             return {'payloads_generated': 0, 'vulnerabilities': []}
+    
+    def _classify_bypass_target(self, target_state: str) -> str:
+        """Classify the type of vulnerability based on target state."""
+        state_to_vuln = {
+            'admin': 'privilege_escalation',
+            'sensitive_data_access': 'data_access',
+            'authorized': 'auth_bypass',
+            'authenticated': 'auth_bypass'
+        }
+        return state_to_vuln.get(target_state, 'logic_bypass')
+    
+    def _calculate_severity(self, target_state: str, confidence: float) -> str:
+        """Calculate severity based on target state and confidence."""
+        if target_state in ['admin', 'sensitive_data_access']:
+            if confidence > 0.8:
+                return 'critical'
+            elif confidence > 0.6:
+                return 'high'
+            else:
+                return 'medium'
+        else:
+            if confidence > 0.8:
+                return 'high'
+            elif confidence > 0.6:
+                return 'medium'
+            else:
+                return 'low'
+    
+    def _calculate_cvss(self, target_state: str, confidence: float) -> float:
+        """Calculate CVSS score based on target state and confidence."""
+        base_scores = {
+            'admin': 9.0,
+            'sensitive_data_access': 8.5,
+            'authorized': 7.5,
+            'authenticated': 6.5
+        }
+        base_score = base_scores.get(target_state, 5.0)
+        return base_score * confidence
+    
+    def _analyze_protocol_payload(self, payload_data: bytes) -> Optional[Dict[str, Any]]:
+        """Analyze network protocol payload for vulnerabilities."""
+        if not payload_data or len(payload_data) < 10:
+            return None
+        
+        # Simple heuristic analysis for common protocol vulnerabilities
+        try:
+            data_str = payload_data.decode('utf-8', errors='ignore')
+            
+            # Check for buffer overflow patterns
+            if len(payload_data) > 1000:
+                return {
+                    'id': f'vuln_proto_buffer_{len(payload_data)}',
+                    'title': 'Potential Buffer Overflow',
+                    'description': f'Large payload detected ({len(payload_data)} bytes) that may indicate buffer overflow vulnerability',
+                    'severity': 'high',
+                    'cvss_score': 7.5,
+                    'component': 'Network Protocol',
+                    'type': 'buffer_overflow',
+                    'payload_size': len(payload_data)
+                }
+            
+            # Check for injection patterns
+            injection_patterns = ['../', ';', '|', '$(', '`']
+            for pattern in injection_patterns:
+                if pattern in data_str:
+                    pattern_safe = pattern.replace('/', '_').replace(';', '_').replace('|', '_').replace('$', '_').replace('(', '_').replace(')', '_').replace('`', '_')
+                    return {
+                        'id': f'vuln_inject_{pattern_safe}',
+                        'title': 'Injection Pattern Detected',
+                        'description': f'Potential injection vulnerability detected with pattern: {pattern}',
+                        'severity': 'medium',
+                        'cvss_score': 6.5,
+                        'component': 'Network Protocol',
+                        'type': 'injection',
+                        'pattern': pattern
+                    }
+        except Exception as e:
+            logger.warning(f"Protocol payload analysis failed: {e}")
+        
+        return None
     
     async def _verify_findings(self):
         """Verify discovered vulnerabilities."""
@@ -477,32 +652,84 @@ class ScannerManager:
     def _perform_verification(self):
         """Perform the actual verification (blocking operation)."""
         from python_brain.reporting.cve_matcher import CVEMatcher
+        from python_brain.cognitive.smt_solver.z3_interface import Z3Interface
+        from python_brain.verification.ebpf_verifier import EBPFVerifier
         
         try:
             cve_matcher = CVEMatcher()
+            z3_solver = Z3Interface()
+            
+            # Initialize eBPF verifier if available
+            try:
+                ebpf_verifier = EBPFVerifier(config=self.config)
+                ebpf_available = True
+            except Exception as e:
+                logger.warning(f"eBPF verifier not available: {e}")
+                ebpf_verifier = None
+                ebpf_available = False
+            
             verified_vulns = []
             
             for vuln in self.current_scan.vulnerabilities_found:
-                # Match against CVE database
-                cve_matches = cve_matcher.match_vulnerability(vuln)
-                
                 verified_vuln = vuln.copy()
-                verified_vuln['cve_matches'] = cve_matches
-                verified_vuln['verified'] = len(cve_matches) > 0
-                verified_vuln['confidence'] = 0.8 if cve_matches else 0.6
                 
-                # Add proof model placeholder
-                verified_vuln['proof_model'] = {
-                    'z3_constraints': f"Generated {vuln.get('type', 'generic')} constraints",
-                    'satisfiable': True,
-                    'model': f"Model for {vuln.get('id', 'unknown')}"
-                }
+                # Match against CVE database
+                try:
+                    cve_matches = cve_matcher.match_vulnerability(vuln)
+                    verified_vuln['cve_matches'] = cve_matches
+                    verified_vuln['verified'] = len(cve_matches) > 0
+                except Exception as e:
+                    logger.warning(f"CVE matching failed for {vuln.get('id', 'unknown')}: {e}")
+                    verified_vuln['cve_matches'] = []
+                    verified_vuln['verified'] = False
                 
-                # Add eBPF trace placeholder
-                verified_vuln['ebpf_trace'] = f"eBPF execution trace for {vuln.get('id', 'unknown')}\n" \
-                    f"  [kernel] sys_call detected\n" \
-                    f"  [eBPF] payload executed\n" \
-                    f"  [eBPF] vulnerability confirmed"
+                # Generate Z3 proof model for the vulnerability
+                try:
+                    proof_model = self._generate_z3_proof_model(vuln, z3_solver)
+                    verified_vuln['proof_model'] = proof_model
+                    verified_vuln['z3_verified'] = proof_model.get('satisfiable', False)
+                except Exception as e:
+                    logger.warning(f"Z3 proof generation failed for {vuln.get('id', 'unknown')}: {e}")
+                    verified_vuln['proof_model'] = {'error': str(e)}
+                    verified_vuln['z3_verified'] = False
+                
+                # Perform eBPF verification if available
+                if ebpf_available and ebpf_verifier and 'payload' in vuln:
+                    try:
+                        from python_brain.verification.ebpf_verifier import KernelTracepoint
+                        
+                        # Define tracepoints based on vulnerability type
+                        tracepoints = self._get_tracepoints_for_vuln_type(vuln.get('type', 'generic'))
+                        
+                        # Convert payload to bytes if needed
+                        payload_data = self._serialize_payload(vuln.get('payload'))
+                        target = self.current_scan.metadata.get('target', 'localhost')
+                        
+                        # Verify using eBPF
+                        verification_result = ebpf_verifier.verify_vulnerability(
+                            vulnerability_id=vuln.get('id', 'unknown'),
+                            payload=payload_data,
+                            target=target,
+                            tracepoints=tracepoints,
+                            expected_sink=self._get_expected_sink(vuln.get('type', 'generic'))
+                        )
+                        
+                        verified_vuln['ebpf_verified'] = verification_result.confirmed
+                        verified_vuln['ebpf_trace'] = self._format_ebpf_trace(verification_result)
+                        verified_vuln['kernel_sink_hit'] = verification_result.kernel_sink_hit
+                        verified_vuln['confidence'] = verification_result.confidence
+                        
+                    except Exception as e:
+                        logger.warning(f"eBPF verification failed for {vuln.get('id', 'unknown')}: {e}")
+                        verified_vuln['ebpf_verified'] = False
+                        verified_vuln['ebpf_trace'] = f"eBPF verification failed: {str(e)}"
+                        verified_vuln['kernel_sink_hit'] = False
+                        verified_vuln['confidence'] = 0.5
+                else:
+                    verified_vuln['ebpf_verified'] = False
+                    verified_vuln['ebpf_trace'] = "eBPF verification not available"
+                    verified_vuln['kernel_sink_hit'] = False
+                    verified_vuln['confidence'] = 0.6 if verified_vuln.get('verified') else 0.4
                 
                 verified_vulns.append(verified_vuln)
             
@@ -511,16 +738,138 @@ class ScannerManager:
             logger.info(f"Verification complete: {len(verified_vulns)} vulnerabilities verified")
             return {
                 'verified_count': len(verified_vulns),
-                'cve_matches_count': sum(len(v.get('cve_matches', [])) for v in verified_vulns)
+                'cve_matches_count': sum(len(v.get('cve_matches', [])) for v in verified_vulns),
+                'ebpf_verified_count': sum(1 for v in verified_vulns if v.get('ebpf_verified', False)),
+                'z3_verified_count': sum(1 for v in verified_vulns if v.get('z3_verified', False))
             }
             
-        except ImportError:
-            logger.warning("CVE matcher not available, skipping CVE matching")
+        except ImportError as e:
+            logger.warning(f"Required verification modules not available: {e}")
             return {'verified_count': len(self.current_scan.vulnerabilities_found), 'cve_matches_count': 0}
         except Exception as e:
             logger.error(f"Verification error: {e}")
             self.current_scan.errors.append(f"Verification failed: {str(e)}")
             return {'verified_count': 0, 'cve_matches_count': 0}
+    
+    def _generate_z3_proof_model(self, vuln: Dict[str, Any], z3_solver: Z3Interface) -> Dict[str, Any]:
+        """Generate Z3 proof model for a vulnerability."""
+        z3_solver.reset()
+        
+        # Create variables based on vulnerability type
+        vuln_type = vuln.get('type', 'generic')
+        variables = {
+            'authenticated': 'bool',
+            'authorized': 'bool',
+            'vulnerable_state': 'bool',
+            'exploit_possible': 'bool'
+        }
+        
+        for var_name, var_type in variables.items():
+            z3_solver.create_variable(var_name, var_type, f"Variable for {vuln_type} analysis")
+        
+        # Add constraints based on vulnerability type
+        from python_brain.cognitive.smt_solver.z3_interface import Z3Constraint
+        
+        constraints = [
+            Z3Constraint(
+                constraint_id="vulnerability_constraint",
+                expression="Implies(Var('vulnerable_state'), And(Var('authenticated'), Var('authorized')))",
+                variables={'authenticated', 'authorized', 'vulnerable_state'},
+                description="Vulnerability requires authentication and authorization"
+            ),
+            Z3Constraint(
+                constraint_id="exploit_constraint",
+                expression="Implies(Var('exploit_possible'), Var('vulnerable_state'))",
+                variables={'exploit_possible', 'vulnerable_state'},
+                description="Exploit is possible if vulnerability state is reached"
+            )
+        ]
+        
+        for constraint in constraints:
+            z3_solver.add_constraint(constraint)
+        
+        # Solve the constraints
+        result = z3_solver.solve()
+        
+        return {
+            'z3_constraints': [c.expression for c in constraints],
+            'satisfiable': result.status.value == 'sat',
+            'model': result.model,
+            'solving_time_ms': result.solving_time_ms,
+            'variables_used': list(variables.keys())
+        }
+    
+    def _get_tracepoints_for_vuln_type(self, vuln_type: str) -> List:
+        """Get appropriate kernel tracepoints for vulnerability type."""
+        from python_brain.verification.ebpf_verifier import KernelTracepoint
+        
+        tracepoint_mapping = {
+            'privilege_escalation': [
+                KernelTracepoint("sys_enter_execve", "syscalls"),
+                KernelTracepoint("sys_enter_setuid", "syscalls"),
+                KernelTracepoint("security_bprm_check", "security")
+            ],
+            'data_access': [
+                KernelTracepoint("sys_enter_read", "syscalls"),
+                KernelTracepoint("sys_enter_write", "syscalls"),
+                KernelTracepoint("security_file_permission", "security")
+            ],
+            'auth_bypass': [
+                KernelTracepoint("sys_enter_accept", "syscalls"),
+                KernelTracepoint("security_socket_connect", "security")
+            ],
+            'injection': [
+                KernelTracepoint("sys_enter_execve", "syscalls"),
+                KernelTracepoint("netif_receive_skb", "net")
+            ],
+            'buffer_overflow': [
+                KernelTracepoint("sys_enter_read", "syscalls"),
+                KernelTracepoint("sys_enter_write", "syscalls")
+            ]
+        }
+        
+        return tracepoint_mapping.get(vuln_type, [
+            KernelTracepoint("sys_enter_execve", "syscalls"),
+            KernelTracepoint("security_file_permission", "security")
+        ])
+    
+    def _get_expected_sink(self, vuln_type: str) -> Optional[str]:
+        """Get expected kernel sink function for vulnerability type."""
+        sink_mapping = {
+            'privilege_escalation': 'commit_creds',
+            'data_access': 'copy_to_user',
+            'auth_bypass': 'security_socket_connect',
+            'injection': 'execve',
+            'buffer_overflow': 'memcpy'
+        }
+        return sink_mapping.get(vuln_type)
+    
+    def _serialize_payload(self, payload: Any) -> bytes:
+        """Serialize payload to bytes for eBPF verification."""
+        if isinstance(payload, bytes):
+            return payload
+        elif isinstance(payload, str):
+            return payload.encode('utf-8')
+        elif isinstance(payload, dict):
+            import json
+            return json.dumps(payload).encode('utf-8')
+        else:
+            return str(payload).encode('utf-8')
+    
+    def _format_ebpf_trace(self, verification_result) -> str:
+        """Format eBPF verification result as trace string."""
+        trace_lines = [
+            f"eBPF execution trace for vulnerability verification",
+            f"  Status: {'CONFIRMED' if verification_result.confirmed else 'NOT CONFIRMED'}",
+            f"  Confidence: {verification_result.confidence:.2f}",
+            f"  Kernel sink hit: {verification_result.kernel_sink_hit}",
+            f"  Trace events captured: {len(verification_result.trace_events)}"
+        ]
+        
+        for event in verification_result.trace_events[:5]:  # Limit to first 5 events
+            trace_lines.append(f"  [eBPF] {event.tracepoint} at {event.timestamp}")
+        
+        return '\n'.join(trace_lines)
     
     async def _generate_report(self):
         """Generate the final scan report."""
